@@ -1,0 +1,190 @@
+﻿#pragma kernel CSMainClearGrid
+#pragma kernel CSMainP2G
+#pragma kernel CSMainGrid
+#pragma kernel CSMainG2P
+
+const float n = 80.0f;
+const float dt = 0.0001f;
+
+const float particle_mass = 1.0f;
+const float vol = 1.0f;
+const float hardening = 10.0f;
+const float E = 10000.0f;
+const float nu = 0.2f;
+const int plastic = 1;
+
+const float boundary = 2.25f;
+
+struct Particle {
+    float2 x, v;
+    float2x2 F, C;
+    float Jp;
+};
+
+RWStructuredBuffer<Particle> Particles;
+RWTexture2D<float4> Grid;
+
+float2 sqr(float2 v) {
+    return v * v;
+}
+
+void polar_decomp(float2x2 m, out float2x2 R, out float2x2 S) {
+    const float x = m._m00 + m._m11;
+    const float y = m._m10 - m._m01;
+    const float scale = rsqrt(x * x + y * y);
+    const float c = x * scale;
+    const float s = y * scale;
+    R = float2x2(c, s, -s, c);
+    S = mul(m, R);
+}
+
+void svd(float2x2 F, out float2x2 U, out float2x2 sig, out float2x2 V) {
+    float2x2 S;
+    polar_decomp(F, U, S);
+    float c, s;
+    if (abs(S._m01) < 0.000001) {
+        sig = S;
+        c = 1;
+        s = 0;
+    } else {
+        float tao = 0.5f * (S._m00 - S._m11);
+        float w = sqrt(tao * tao + S._m01 * S._m01);
+        float t = tao > 0.0f ? S._m01 / (tao + w) : S._m01 / (tao - w);
+        c = rsqrt(t * t + 1.0f);
+        s = -t * c;
+        sig = float2x2(
+            c * c * S._m00 - 2.0f * c * s * S._m01 + s * s * S._m11, 0,
+            0, s * s * S._m00 + 2.0f * c * s * S._m01 + c * c * S._m11
+        );
+    }
+    if (sig._m00 < sig._m11) {
+        float tmp = sig._m00;
+        sig._m00 = sig._m11;
+        sig._m11 = tmp;
+        V = float2x2(-s, -c, c, -s);
+    } else {
+        V = float2x2(c, -s, s, c);
+    }
+    V = transpose(V);
+    U = mul(U, V);
+}
+
+float2x2 outer_product(float2 a, float2 b) {
+    return float2x2(
+        a.x * b.x, a.y * b.x,
+        a.x * b.y, a.y * b.y
+    );
+}
+
+[numthreads(8,8,1)]
+void CSMainClearGrid (uint3 id : SV_DispatchThreadID)
+{
+    Grid[id.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+[numthreads(16,1,1)]
+void CSMainP2G (uint3 id : SV_DispatchThreadID)
+{
+    const float dx = 1.0f / n;
+    const float inv_dx = 1.0f / dx;
+    const float mu_0 = E / (2.0f * (1.0f + nu));
+    const float lambda_0 = E * nu / ((1.0f + nu) * (1.0f - 2.0f * nu));
+
+    Particle p = Particles[id.x];
+
+    const int2 base_coord = asint(p.x * inv_dx - float2(0.5f, 0.5f));
+    const float2 fx = p.x * inv_dx - asfloat(base_coord);
+    const float2 w[3] = {
+        float2(0.5f, 0.5f) * sqr(float2(1.5f, 1.5f) - fx),
+        float2(0.75f, 0.75f) - sqr(fx - float2(1.0f, 1.0f)),
+        float2(0.5f, 0.5f) * sqr(fx - float2(0.5f, 0.5f))
+    };
+
+    const float e = exp(hardening * (1.0f - p.Jp));
+    const float mu = mu_0 * e;
+    const float lambda = lambda_0 * e;
+
+    const float J = determinant(p.F);
+    float2x2 R, S;
+    polar_decomp(p.F, R, S);
+    const float k1 = -4.0f * inv_dx * inv_dx * dt * vol;
+    const float k2 = lambda * (J - 1.0f) * J;
+    const float2x2 stress = k1 * (2.0f * mu * mul(transpose(p.F) - R, p.F) + float2x2(k2, 0, 0, k2));
+    const float2x2 affine = stress + particle_mass * p.C;
+
+    const float3 mv = float3(p.v * particle_mass, particle_mass);
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            const float2 dpos = (float2(i, j) - fx) * dx;
+            const int2 idx = base_coord + int2(i, j);
+            const float weight = w[i].x * w[j].y;
+            Grid[idx] += float4(weight * (mv + float3(mul(affine, dpos), 0.0f)), 0.0f);
+        }
+    }
+}
+
+[numthreads(8,8,1)]
+void CSMainGrid (uint3 id : SV_DispatchThreadID)
+{
+    float3 g = Grid[id.xy].xyz;
+    if (g.z > 0.0f) {
+        g /= g.z;
+        g.y += -200.0f * dt;
+        float2 xy = 5.0f * (id.xy / n - float2(0.5f, 0.5f));
+
+        // if (xy.x < -boundary || xy.x > boundary || xy.y > boundary) {
+        //     g = float3(0.0f, 0.0f, 0.0f);
+        // }
+
+        // if (xy.y < -boundary) {
+        //     g.y = max(-boundary, g.y);
+        // }
+
+        Grid[id.xy] = float4(g, 0.0f);
+    }
+}
+
+[numthreads(16,1,1)]
+void CSMainG2P (uint3 id : SV_DispatchThreadID)
+{
+    const float dx = 1.0f / n;
+    const float inv_dx = 1.0f / dx;
+
+    Particle p = Particles[id.x];
+
+    const int2 base_coord = asint(p.x * inv_dx - float2(0.5f, 0.5f));
+    const float2 fx = p.x * inv_dx - asfloat(base_coord);
+    const float2 w[3] = {
+        float2(0.5f, 0.5f) * sqr(float2(1.5f, 1.5f) - fx),
+        float2(0.75f, 0.75f) - sqr(fx - float2(1.0f, 1.0f)),
+        float2(0.5f, 0.5f) * sqr(fx - float2(0.5f, 0.5f))
+    };
+
+    p.v = float2(0.0f, -1.0f);
+    p.C = float2x2(0, 0, 0, 0);
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            const float2 dpos = float2(i, j) - fx;
+            const int2 idx = base_coord + int2(i, j);
+            const float weight = w[i].x * w[j].y;
+            p.v += Grid[idx].xy * weight;
+            p.C += 4.0f * inv_dx * outer_product(weight * Grid[idx].xy, dpos);
+        }
+    }
+
+    p.x += dt * p.v;
+
+    float2x2 F = mul(p.F, float2x2(1, 0, 0, 1) + dt * p.C);
+
+    float2x2 svd_u, sig, svd_v;
+    svd(F, svd_u, sig, svd_v);
+    if (plastic == 1) {
+        sig._m00 = clamp(sig._m00, 1.0f - 0.025f, 1.0f + 0.0075f);
+        sig._m11 = clamp(sig._m11, 1.0f - 0.025f, 1.0f + 0.0075f);
+    }
+
+    p.F = mul(mul(svd_u, sig), transpose(svd_v));
+    p.Jp = clamp(p.Jp * determinant(F) / determinant(p.F), 0.6f, 20.0f);
+
+    Particles[id.x] = p;
+}
